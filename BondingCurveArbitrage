@@ -1,0 +1,126 @@
+import os
+import asyncio
+from web3 import Web3
+from web3.middleware import geth_poa_middleware
+from decimal import Decimal
+from eth_account import Account
+from dotenv import load_dotenv
+import json
+
+load_dotenv()
+
+# Load environment variables
+ETHEREUM_WS = os.getenv("ETHEREUM_WS")
+BSC_WS = os.getenv("BSC_WS")
+PRIVATE_KEY = os.getenv("PRIVATE_KEY")
+ARBITRAGE_CONTRACT_ADDRESS = os.getenv("ARBITRAGE_CONTRACT_ADDRESS")
+SWAP_ROUTER_ADDRESS = os.getenv("SWAP_ROUTER_ADDRESS")
+
+# Connect to Ethereum and BSC via WebSocket
+w3_eth = Web3(Web3.WebsocketProvider(ETHEREUM_WS))
+w3_bsc = Web3(Web3.WebsocketProvider(BSC_WS))
+
+# For BSC chain compatibility (if needed)
+w3_bsc.middleware_onion.inject(geth_poa_middleware, layer=0)
+
+account = Account.from_key(PRIVATE_KEY)
+address = account.address
+
+# Load UniswapV3 Pool ABI (simplified for slot0 and flash)
+with open("uniswap_v3_pool_abi.json") as f:
+    pool_abi = json.load(f)
+
+with open("flashswap_arb_abi.json") as f:
+    arb_abi = json.load(f)
+
+# Contract instances
+arb_contract = w3_eth.eth.contract(address=ARBITRAGE_CONTRACT_ADDRESS, abi=arb_abi)
+
+# Example pool addresses (replace with actual ones)
+uniswap_pool_address = Web3.toChecksumAddress("0x8ad599c3a0ff1de082011efddc58f1908eb6e6d8")  # ETH mainnet BTC-USDT
+pancake_pool_address = Web3.toChecksumAddress("0xYOUR_PANCAKESWAP_V3_POOL_ADDRESS")  # BSC BTC-USDT
+
+uni_pool = w3_eth.eth.contract(address=uniswap_pool_address, abi=pool_abi)
+pancake_pool = w3_bsc.eth.contract(address=pancake_pool_address, abi=pool_abi)
+
+FEE_TOLERANCE = Decimal("0.003")  # 0.3% minimum arbitrage margin
+
+def get_price_from_slot0(pool_contract):
+    slot0 = pool_contract.functions.slot0().call()
+    sqrtPriceX96 = slot0[0]
+    price = (Decimal(sqrtPriceX96) / Decimal(2**96)) ** 2
+    return price
+
+async def monitor_pools():
+    print("Starting real-time pool monitoring...")
+
+    while True:
+        try:
+            uni_price = get_price_from_slot0(uni_pool)
+            pancake_price = get_price_from_slot0(pancake_pool)
+
+            print(f"Uniswap V3 BTC-USDT price: {uni_price:.8f}")
+            print(f"PancakeSwap V3 BTC-USDT price: {pancake_price:.8f}")
+
+            diff = abs(uni_price - pancake_price) / min(uni_price, pancake_price)
+
+            if diff > FEE_TOLERANCE:
+                print(f"Arbitrage opportunity detected! Price difference: {diff:.4%}")
+                if uni_price > pancake_price:
+                    # Buy on PancakeSwap, sell on Uniswap
+                    await execute_arbitrage(
+                        pool0=uniswap_pool_address,
+                        pool1=pancake_pool_address,
+                        token0=Web3.toChecksumAddress("0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"),  # WBTC
+                        token1=Web3.toChecksumAddress("0xdAC17F958D2ee523a2206206994597C13D831ec7"),  # USDT
+                        amount0=Web3.toWei(0.01, 'ether'),  # Example amount
+                        amount1=0,
+                        fee0=3000,  # 0.3% fee tier
+                        fee1=3000
+                    )
+                else:
+                    # Buy on Uniswap, sell on PancakeSwap
+                    await execute_arbitrage(
+                        pool0=pancake_pool_address,
+                        pool1=uniswap_pool_address,
+                        token0=Web3.toChecksumAddress("0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"),
+                        token1=Web3.toChecksumAddress("0xdAC17F958D2ee523a2206206994597C13D831ec7"),
+                        amount0=Web3.toWei(0.01, 'ether'),
+                        amount1=0,
+                        fee0=3000,
+                        fee1=3000
+                    )
+            else:
+                print("No arbitrage opportunity at this time.")
+
+            await asyncio.sleep(5)  # Poll every 5 seconds
+
+        except Exception as e:
+            print(f"Error during monitoring: {e}")
+            await asyncio.sleep(10)
+
+async def execute_arbitrage(pool0, pool1, token0, token1, amount0, amount1, fee0, fee1):
+    print("Preparing arbitrage transaction...")
+
+    nonce = w3_eth.eth.get_transaction_count(address)
+    tx = arb_contract.functions.executeArbitrage(
+        pool0, pool1, token0, token1, amount0, amount1, fee0, fee1
+    ).buildTransaction({
+        'from': address,
+        'nonce': nonce,
+        'gas': 800000,
+        'gasPrice': w3_eth.eth.gas_price,
+    })
+
+    signed_tx = w3_eth.eth.account.sign_transaction(tx, private_key=PRIVATE_KEY)
+    tx_hash = w3_eth.eth.send_raw_transaction(signed_tx.rawTransaction)
+
+    print(f"Arbitrage tx sent: {tx_hash.hex()}")
+    receipt = w3_eth.eth.wait_for_transaction_receipt(tx_hash)
+    if receipt.status == 1:
+        print("Arbitrage executed successfully!")
+    else:
+        print("Arbitrage transaction failed.")
+
+if __name__ == "__main__":
+    asyncio.run(monitor_pools())
