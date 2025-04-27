@@ -1,0 +1,80 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+import "@uniswap/v3-core/contracts/interfaces/IUniswapV3Pool.sol";
+import "@uniswap/v3-core/contracts/interfaces/callback/IUniswapV3FlashCallback.sol";
+import "@uniswap/v3-periphery/contracts/interfaces/ISwapRouter.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+contract FlashSwapArbitrage is IUniswapV3FlashCallback {
+    address public owner;
+    ISwapRouter public immutable swapRouter;
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not owner");
+        _;
+    }
+
+    constructor(address _swapRouter) {
+        owner = msg.sender;
+        swapRouter = ISwapRouter(_swapRouter);
+    }
+
+    // Initiate flash swap from pool0, swap on pool1, repay pool0
+    function executeArbitrage(
+        address pool0,
+        address pool1,
+        address token0,
+        address token1,
+        uint256 amount0,
+        uint256 amount1,
+        uint24 fee0,
+        uint24 fee1
+    ) external onlyOwner {
+        // Flash swap from pool0
+        IUniswapV3Pool(pool0).flash(address(this), amount0, amount1, abi.encode(pool1, token0, token1, fee0, fee1));
+    }
+
+    // Called by pool0 after flash swap
+    function uniswapV3FlashCallback(
+        uint256 fee0,
+        uint256 fee1,
+        bytes calldata data
+    ) external override {
+        (address pool1, address token0, address token1, uint24 fee0_, uint24 fee1_) = abi.decode(data, (address, address, address, uint24, uint24));
+
+        // Verify caller is a valid pool (security)
+        require(msg.sender == pool1 || msg.sender == tx.origin, "Unauthorized callback");
+
+        // Amounts owed to pool0 (borrowed + fee)
+        uint256 amount0Owed = IERC20(token0).balanceOf(address(this)) + fee0;
+        uint256 amount1Owed = IERC20(token1).balanceOf(address(this)) + fee1;
+
+        // Swap borrowed token on pool1 to repay pool0
+        IERC20(token0).approve(address(swapRouter), amount0Owed);
+
+        ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
+            tokenIn: token0,
+            tokenOut: token1,
+            fee: fee1_,
+            recipient: address(this),
+            deadline: block.timestamp,
+            amountIn: amount0Owed,
+            amountOutMinimum: 0,
+            sqrtPriceLimitX96: 0
+        });
+
+        uint256 amountOut = swapRouter.exactInputSingle(params);
+
+        // Repay pool0
+        IERC20(token1).transfer(msg.sender, amount1Owed);
+
+        // Profit stays in contract
+    }
+
+    // Withdraw profits
+    function withdraw(address token) external onlyOwner {
+        uint256 balance = IERC20(token).balanceOf(address(this));
+        IERC20(token).transfer(owner, balance);
+    }
+}
